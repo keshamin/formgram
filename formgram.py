@@ -94,7 +94,7 @@ class Field:
 
 
 class StrField(Field):
-    def __init__(self, initial_value: Any = MISSING, required: bool = False,
+    def __init__(self, initial_value: Union[_MISSING_TYPE, str], required: bool = False,
                  label: Optional[str] = None, read_only: bool = False):
         super().__init__(str, initial_value, required, label, read_only)
 
@@ -103,6 +103,12 @@ class StrField(Field):
 
     def from_str(self, string):
         return string
+
+
+class IntField(Field):
+    def __init__(self, initial_value: Union[_MISSING_TYPE, int], required: bool = False,
+                 label: Optional[str] = None, read_only: bool = False):
+        super().__init__(int, initial_value, required, label, read_only)
 
 
 class BoolField(Field):
@@ -173,9 +179,15 @@ class FormMeta(type):
 
         if name != 'BaseForm':
             bot = attrs.get('_bot')
+
             @bot.callback_query_handler(lambda cb: cb.data.startswith(make_form_prefix(name)))
             def handler(callback):
                 class_.handle_cb(class_.from_message(callback.message.text), callback)
+
+            @bot.callback_query_handler(lambda cb: cb.data == CANCEL_CB_DATA)
+            def cancel(cb):
+                bot.delete_message(cb.message.chat.id, cb.message.message_id)
+                bot.next_step_handlers.pop(cb.message.chat.id, None)
 
         return class_
 
@@ -201,13 +213,7 @@ class BaseForm(metaclass=FormMeta):
     cancel_callback = None
 
     def __post_init__(self, *_, **__):
-        # self._bot.callback_query_handler(
-        #     lambda cb: cb.data.startswith(make_form_prefix(self.__class__.__name__)))(self.handle_cb)
-
-        @self._bot.callback_query_handler(lambda cb: cb.data == CANCEL_CB_DATA)
-        def cancel(cb):
-            self._bot.delete_message(cb.message.chat.id, cb.message.message_id)
-            self._bot.next_step_handlers.pop(cb.message.chat.id, None)
+        pass
 
     def make_edit_cb_data(self, field_name):
         return make_edit_cb_data(self.__class__.__name__, field_name)
