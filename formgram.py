@@ -1,6 +1,10 @@
 import copy
 import enum
+import re
+from collections import Iterable
+from dataclasses import dataclass
 from typing import Optional, Any, Dict, List, Tuple, Callable, Union
+from urllib.parse import urlparse
 
 import telebot
 from telebot import types as tb_types
@@ -11,12 +15,20 @@ MISSING_VALUE_SYMBOL = '💢'
 EDIT_SYMBOL = '✏️'
 
 
+@dataclass
+class CustomButton:
+    text: str
+    callback: Callable[['BaseForm', tb_types.CallbackQuery], None]
+    closes_form: bool
+
+
 class FormActions(enum.Enum):
     EDIT = 'ed'
     SUBMIT = 'ok'
     CANCEL = 'ca'
     DISPLAY_MAIN = 'dm'
     INLINE_EDIT = 'ie'
+    CUSTOM_BUTTON = 'cb'
 
 
 def make_form_prefix(form_name: str) -> str:
@@ -33,6 +45,10 @@ def make_inline_edit_cb_data(form_name: str, field_name: str, value: str) -> str
 
 def make_cb_data(form_name, form_action: FormActions):
     return f'{make_form_prefix(form_name)}/{form_action.value}'
+
+
+def make_custom_button_cb_data(form_name, button_text):
+    return f'{make_form_prefix(form_name)}/{FormActions.CUSTOM_BUTTON.value}/{button_text}'
 
 
 CANCEL_CB_DATA = f'{FORMGRAM_PREFIX}/cancel'
@@ -68,13 +84,18 @@ class Field:
         if type(new_value) not in (self.type_, type(None)):
             raise ValueError(f'Field value must be of type {self.type_}, not {type(new_value)}')
 
+        self.validate_input(new_value)
+
         self._value = new_value
 
-    def __get__(self, instance, owner):
-        return self.value
+    def __get__(self, instance, type_=None):
+        return instance.fields_dict[self.name].value
 
     def __set__(self, instance, value):
-        self.value = value
+        instance.fields_dict[self.name].value = value
+
+    def validate_input(self, new_value):
+        pass
 
     def needs_value(self):
         return self.required and self.value is None
@@ -84,8 +105,11 @@ class Field:
             return missing_value_str
         return str(self.value)
 
-    def from_repr(self, string):
-        return self.type_(string), None
+    def from_repr(self, string, missing_value_str: str):
+        value = self.type_(string)
+        if value == missing_value_str:
+            return None, None
+        return value, None
 
     def from_str_value(self, string):
         return self.type_(string)
@@ -108,15 +132,14 @@ class Field:
         sent_msg = bot.send_message(cb.message.chat.id, 'Send new value', reply_markup=edit_cancel_markup)
 
         def handler(msg: tb_types.Message):
+            bot.edit_message_reply_markup(sent_msg.chat.id, sent_msg.message_id,
+                                          reply_markup=tb_types.InlineKeyboardMarkup())
             try:
                 self.value = self.from_str_value(msg.text)
             except ValueError as e:
-                bot.send_message(cb.message.chat.id, f'Invalid value, cannot cast to {self.type_}')
+                bot.send_message(cb.message.chat.id, str(e))
                 return
-            bot.edit_message_reply_markup(sent_msg.chat.id, sent_msg.message_id,
-                                          reply_markup=tb_types.InlineKeyboardMarkup())
-            bot.delete_message(cb.message.chat.id, cb.message.message_id)
-            bot.send_message(cb.message.chat.id, form.to_message(), reply_markup=form.make_markup())
+            form.refresh(cb.message.chat.id, cb.message.message_id, resend=True)
         bot.register_next_step_handler(cb.message, handler)
 
 
@@ -130,8 +153,29 @@ class StrField(Field):
             return missing_value_str
         return self.value
 
-    def from_repr(self, string):
+    def from_repr(self, string, missing_value_str: str):
+        if string == missing_value_str:
+            return None, None
         return string, None
+
+
+class LinkField(StrField):
+    html_link_re = r'<a.*?>(.*?)</a>'
+
+    def from_repr(self, string, missing_value_str: str):
+        found = re.findall(self.html_link_re, string)
+        if len(found) == 0:
+            return None, None
+        found = found[0]
+        if found == missing_value_str:
+            return None, None
+        return found, None
+
+    def validate_input(self, new_value):
+        url = urlparse(new_value)
+        if '' not in (url.scheme, url.netloc):
+            return
+        raise ValueError(f'Link is not found in {new_value}')
 
 
 class IntField(Field):
@@ -157,7 +201,9 @@ class BoolField(Field):
             return missing_value_str
         return self.val2repr[self.value]
 
-    def from_repr(self, string):
+    def from_repr(self, string, missing_value_str: str):
+        if string == missing_value_str:
+            return None, None
         return self.repr2val[string], None
 
     def _handle_edit(self, bot: telebot.TeleBot, form: 'BaseForm', cb: tb_types.CallbackQuery):
@@ -219,9 +265,11 @@ class InlineDynamicChoiceField(InlineChoiceField):
 
         return f'{value}[\u2009]({self.link_prefix}{joined_choices})'
 
-    def from_repr(self, string):
+    def from_repr(self, string: str, missing_value_str: str):
         a_idx = string.rfind('<a href=')
         value = string[:a_idx]
+        if value == missing_value_str:
+            value = None
         href = string.split('"')[1]
         choices = href[len(self.link_prefix):].split(self.separator)
         return value, {'value': value, 'choices': choices}
@@ -303,6 +351,31 @@ class FormMeta(type):
                 bot.delete_message(cb.message.chat.id, cb.message.message_id)
                 bot.next_step_handlers.pop(cb.message.chat.id, None)
 
+        # Custom buttons normalization
+        if class_.custom_buttons is not None:
+            buttons = []
+            buttons_dict = {}
+
+            for obj in class_.custom_buttons:
+                if isinstance(obj, CustomButton):
+                    buttons.append([obj])
+                    buttons_dict[obj.text] = obj
+                    continue
+
+                if not isinstance(obj, Iterable):
+                    raise ValueError('Items of custon_buttons list must be either '
+                                     'CustomButton\'s or Iterable[CustomButton]')
+
+                buttons.append(obj)
+                for button in obj:
+                    if not isinstance(button, CustomButton):
+                        raise ValueError('Items of custon_buttons list must be either '
+                                         'CustomButton\'s or Iterable[CustomButton]')
+                    buttons_dict[button.text] = button
+
+            class_.custom_buttons = buttons
+            class_.custom_buttons_dict = buttons_dict
+
         return class_
 
 
@@ -340,12 +413,20 @@ class BaseForm(metaclass=FormMeta):
         return make_inline_edit_cb_data(self.__class__.__name__, field_name, value)
 
     def make_ok_cb_data(self):
-        return make_cb_data(self.__class__.__name__, FormActions.SUBMIT)
+        return self.make_cb_data(FormActions.SUBMIT)
 
     def make_cancel_cb_data(self):
-        return make_cb_data(self.__class__.__name__, FormActions.CANCEL)
+        return self.make_cb_data(FormActions.CANCEL)
 
-    def refresh(self, chat_id, message_id):
+    def make_custom_button_cb_data(self, button_text: str):
+        return make_custom_button_cb_data(self.__class__.__name__, button_text)
+
+    def refresh(self, chat_id, message_id, resend=False):
+        if resend:
+            self._bot.delete_message(chat_id, message_id)
+            self._bot.send_message(chat_id, self.to_message(), reply_markup=self.make_markup(), parse_mode='Markdown')
+            return
+
         self._bot.edit_message_text(self.to_message(), chat_id, message_id, reply_markup=self.make_markup(),
                                     parse_mode='Markdown')
 
@@ -357,7 +438,8 @@ class BaseForm(metaclass=FormMeta):
             FormActions.SUBMIT.value: self.handle_submit,
             FormActions.CANCEL.value: self.handle_cancel,
             FormActions.DISPLAY_MAIN.value: self.handle_display_main,
-            FormActions.INLINE_EDIT.value: self.hanlde_inline_edit
+            FormActions.INLINE_EDIT.value: self.hanlde_inline_edit,
+            FormActions.CUSTOM_BUTTON.value: self.handle_custom_button,
         }
         if action not in action_to_handler:
             self._bot.answer_callback_query(callback.id, 'Unknown callback data!')
@@ -375,20 +457,19 @@ class BaseForm(metaclass=FormMeta):
         try:
             self.validate()
         except ValidationError as ve:
-            msg = ''
             if ve.missing_fields:
                 msg = 'Fill all required fields first!'
             else:
                 msg = 'Validation error!'
             self._bot.answer_callback_query(cb.id, msg)
             return
-        self._bot.edit_message_reply_markup(cb.message.chat.id, cb.message.message_id,
-                                            reply_markup=tb_types.InlineKeyboardMarkup())
+
+        self.close_form(cb.message.chat.id, cb.message.message_id)
         self.submit_callback()
 
     def handle_cancel(self, cb: tb_types.CallbackQuery):
-        self._bot.edit_message_reply_markup(cb.message.chat.id, cb.message.message_id,
-                                            reply_markup=tb_types.InlineKeyboardMarkup())
+        self.close_form(cb.message.chat.id, cb.message.message_id)
+
         if self.cancel_callback is not None:
             self.cancel_callback()
 
@@ -406,6 +487,16 @@ class BaseForm(metaclass=FormMeta):
             self._bot.answer_callback_query(cb.id, 'Invalid value provided!')
             return
         self.refresh(cb.message.chat.id, cb.message.message_id)
+
+    def handle_custom_button(self, cb: tb_types.CallbackQuery):
+        parts = cb.data.split('/')
+        button_text = '/'.join(parts[4:])
+        button_options = self.custom_buttons_dict[button_text]
+
+        button_options.callback(self, cb)
+
+        if button_options.closes_form:
+            self.close_form(cb.message.chat.id, cb.message.message_id)
 
     @property
     def fields(self) -> List[Field]:
@@ -436,11 +527,7 @@ class BaseForm(metaclass=FormMeta):
             field_name = cls._label_to_field[label]
             field = cls.fields_dict[field_name]
 
-            if value == cls.missing_value_str:
-                kwargs[field_name] = None
-                continue
-
-            value, metadata = cls.fields_dict[field_name].from_repr(value)
+            value, metadata = field.from_repr(value, missing_value_str=cls.missing_value_str)
 
             if not metadata:
                 kwargs[field_name] = value
@@ -450,6 +537,9 @@ class BaseForm(metaclass=FormMeta):
             kwargs[field_name] = field
 
         return cls(**kwargs, **additional_kwargs)
+
+    def close_form(self, chat_id, message_id):
+        self._bot.edit_message_reply_markup(chat_id, message_id, reply_markup=tb_types.InlineKeyboardMarkup())
 
     def validate(self):
         missing_fields = dict(filter(
@@ -464,8 +554,14 @@ class BaseForm(metaclass=FormMeta):
         for field_name, field in filter(lambda x: not x[1].read_only, self.fields_dict.items()):
             markup.add(field.make_button(self.make_edit_cb_data(field_name)))
 
-        if self.custom_buttons:
-            markup.add(*self.custom_buttons)
+        for button_row in self.custom_buttons:
+            buttons = []
+            for custom_button in button_row:
+                buttons.append(tb_types.InlineKeyboardButton(
+                    text=custom_button.text,
+                    callback_data=self.make_custom_button_cb_data(custom_button.text)
+                ))
+            markup.row(*buttons)
 
         ok_cancel_buttons = [tb_types.InlineKeyboardButton('OK', callback_data=self.make_ok_cb_data())]
         if self.cancel_callback is not None:
@@ -474,3 +570,6 @@ class BaseForm(metaclass=FormMeta):
         markup.row(*ok_cancel_buttons)
 
         return markup
+
+    def send_form(self, chat_id):
+        self._bot.send_message(chat_id, self.to_message(), reply_markup=self.make_markup(), parse_mode='Markdown')
