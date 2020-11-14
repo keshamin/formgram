@@ -10,9 +10,9 @@ I haven't published the package on PyPI yet. If you want to use `formgram` on th
 ## Demo
 
 
-Demo GIF for [examples/example.py](examples/example.py):
+Demo GIF for [docs/examples/example.py](docs/examples/example.py):
 
-<img src="examples/demo.gif" width="250" />
+<img src="docs/img/demo.gif" width="250" />
 
 
 ## Docs
@@ -60,3 +60,5 @@ def send_form(message: telebot.types.Message):
 ```
 
 **That is it!** Formgram takes care of the rest! All fields editing is handled automatically and submit/cancel callbacks are invoked when the form is completed/canceled. 
+
+<img src="docs/img/simple_form.jpeg" width="400" />
