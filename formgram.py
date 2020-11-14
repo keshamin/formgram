@@ -106,10 +106,9 @@ class Field:
         return str(self.value)
 
     def from_repr(self, string, missing_value_str: str):
-        value = self.type_(string)
-        if value == missing_value_str:
+        if string == missing_value_str:
             return None, None
-        return value, None
+        return self.type_(string), None
 
     def from_str_value(self, string):
         return self.type_(string)
@@ -219,8 +218,8 @@ class BoolField(Field):
         return tb_types.InlineKeyboardButton(text=f'{icon} {self.label}', callback_data=callback_data)
 
 
-class InlineChoiceField(Field):
-    def __init__(self, choices: Union[List[str], Callable], initial_value: Optional[str] = None,
+class ChoiceField(Field):
+    def __init__(self, choices: Union[List[str], Callable], row_width: int = 1, initial_value: Optional[str] = None,
                  required: bool = False, label: Optional[str] = None, read_only: bool = False, noneable: bool = True):
 
         if callable(choices):
@@ -230,19 +229,23 @@ class InlineChoiceField(Field):
             raise ValueError('Initial value must be one of choices when provided!')
 
         self.choices = choices
+        self.row_width = row_width
 
         super().__init__(str, initial_value, required, label, read_only, noneable)
 
     def _handle_edit(self, bot: telebot.TeleBot, form: 'BaseForm', cb: tb_types.CallbackQuery):
-        markup = tb_types.InlineKeyboardMarkup()
+        markup = tb_types.InlineKeyboardMarkup(row_width=self.row_width)
+        choice_buttons = []
         for choice in self.choices:
             text = choice
             if self.value == choice:
                 text = '✅ ' + text
-            markup.add(tb_types.InlineKeyboardButton(
+            choice_buttons.append(tb_types.InlineKeyboardButton(
                 text=text,
                 callback_data=form.make_inline_edit_cb_data(self.name, choice)
             ))
+        markup.add(*choice_buttons)
+
         markup.add(tb_types.InlineKeyboardButton(
             text='Cancel',
             callback_data=form.make_cb_data(FormActions.DISPLAY_MAIN)
@@ -250,14 +253,14 @@ class InlineChoiceField(Field):
         bot.edit_message_reply_markup(cb.message.chat.id, cb.message.message_id, reply_markup=markup)
 
 
-class InlineDynamicChoiceField(InlineChoiceField):
+class DynamicChoiceField(ChoiceField):
     link_prefix = 'http://example.com/?data='
     separator = '&&&'
 
-    def __init__(self, required: bool = False, label: Optional[str] = None, read_only: bool = False):
-        self.choices = None
-
-        super().__init__(str, None, required, label, read_only, True)
+    def __init__(self, row_width: int = 1, required: bool = False, label: Optional[str] = None,
+                 read_only: bool = False):
+        super().__init__([], row_width=row_width, initial_value=None, required=required,
+                         label=label, read_only=read_only, noneable=True)
 
     def to_repr(self, missing_value_str: str):
         value = self.value if self.value is not None else ''
@@ -274,7 +277,7 @@ class InlineDynamicChoiceField(InlineChoiceField):
         choices = href[len(self.link_prefix):].split(self.separator)
         return value, {'value': value, 'choices': choices}
 
-    def from_metadata(self, metadata: dict) -> 'InlineDynamicChoiceField':
+    def from_metadata(self, metadata: dict) -> 'DynamicChoiceField':
         field_copy = copy.deepcopy(self)
         field_copy.value = metadata['value']
         field_copy.choices = metadata['choices']
@@ -340,7 +343,7 @@ class FormMeta(type):
         class_.fields_dict = fields_dict
 
         if name != 'BaseForm':
-            bot = attrs.get('_bot')
+            bot = attrs.get('bot')
 
             @bot.callback_query_handler(lambda cb: cb.data.startswith(make_form_prefix(name)))
             def handler(callback):
@@ -395,10 +398,10 @@ class BaseForm(metaclass=FormMeta):
     separator = ': '
     missing_value_str = ''
 
-    _bot: telebot.TeleBot = None
+    bot: telebot.TeleBot = None
     submit_callback = None
     cancel_callback = None
-    custom_buttons: Optional[List[tb_types.InlineKeyboardButton]] = None
+    custom_buttons: List[tb_types.InlineKeyboardButton] = []
 
     def __post_init__(self, *_, **__):
         pass
@@ -423,12 +426,12 @@ class BaseForm(metaclass=FormMeta):
 
     def refresh(self, chat_id, message_id, resend=False):
         if resend:
-            self._bot.delete_message(chat_id, message_id)
-            self._bot.send_message(chat_id, self.to_message(), reply_markup=self.make_markup(), parse_mode='Markdown')
+            self.bot.delete_message(chat_id, message_id)
+            self.bot.send_message(chat_id, self.to_message(), reply_markup=self.make_markup(), parse_mode='Markdown')
             return
 
-        self._bot.edit_message_text(self.to_message(), chat_id, message_id, reply_markup=self.make_markup(),
-                                    parse_mode='Markdown')
+        self.bot.edit_message_text(self.to_message(), chat_id, message_id, reply_markup=self.make_markup(),
+                                   parse_mode='Markdown')
 
     def handle_cb(self, callback: tb_types.CallbackQuery):
         parts = callback.data.split('/')
@@ -442,7 +445,7 @@ class BaseForm(metaclass=FormMeta):
             FormActions.CUSTOM_BUTTON.value: self.handle_custom_button,
         }
         if action not in action_to_handler:
-            self._bot.answer_callback_query(callback.id, 'Unknown callback data!')
+            self.bot.answer_callback_query(callback.id, 'Unknown callback data!')
             return
         action_to_handler[action](callback)
 
@@ -450,8 +453,8 @@ class BaseForm(metaclass=FormMeta):
         field_name = callback.data.split('/')[-1]
         field = self.fields_dict.get(field_name)
         if not field:
-            self._bot.answer_callback_query(callback.id, 'Trying to edit unknown field!')
-        field._handle_edit(self._bot, self, callback)
+            self.bot.answer_callback_query(callback.id, 'Trying to edit unknown field!')
+        field._handle_edit(self.bot, self, callback)
 
     def handle_submit(self, cb: tb_types.CallbackQuery):
         try:
@@ -461,17 +464,17 @@ class BaseForm(metaclass=FormMeta):
                 msg = 'Fill all required fields first!'
             else:
                 msg = 'Validation error!'
-            self._bot.answer_callback_query(cb.id, msg)
+            self.bot.answer_callback_query(cb.id, msg)
             return
 
         self.close_form(cb.message.chat.id, cb.message.message_id)
-        self.submit_callback()
+        self.submit_callback(cb)
 
     def handle_cancel(self, cb: tb_types.CallbackQuery):
         self.close_form(cb.message.chat.id, cb.message.message_id)
 
         if self.cancel_callback is not None:
-            self.cancel_callback()
+            self.cancel_callback(cb)
 
     def handle_display_main(self, cb: tb_types.CallbackQuery):
         self.refresh(cb.message.chat.id, cb.message.message_id)
@@ -484,7 +487,7 @@ class BaseForm(metaclass=FormMeta):
         try:
             field.value = field.from_str_value(new_value)
         except ValueError:
-            self._bot.answer_callback_query(cb.id, 'Invalid value provided!')
+            self.bot.answer_callback_query(cb.id, 'Invalid value provided!')
             return
         self.refresh(cb.message.chat.id, cb.message.message_id)
 
@@ -539,7 +542,7 @@ class BaseForm(metaclass=FormMeta):
         return cls(**kwargs, **additional_kwargs)
 
     def close_form(self, chat_id, message_id):
-        self._bot.edit_message_reply_markup(chat_id, message_id, reply_markup=tb_types.InlineKeyboardMarkup())
+        self.bot.edit_message_reply_markup(chat_id, message_id, reply_markup=tb_types.InlineKeyboardMarkup())
 
     def validate(self):
         missing_fields = dict(filter(
@@ -572,4 +575,4 @@ class BaseForm(metaclass=FormMeta):
         return markup
 
     def send_form(self, chat_id):
-        self._bot.send_message(chat_id, self.to_message(), reply_markup=self.make_markup(), parse_mode='Markdown')
+        self.bot.send_message(chat_id, self.to_message(), reply_markup=self.make_markup(), parse_mode='Markdown')
