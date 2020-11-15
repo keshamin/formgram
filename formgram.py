@@ -1,14 +1,11 @@
 import copy
 import enum
-import re
 from collections import Iterable
 from dataclasses import dataclass
 from typing import Optional, Any, Dict, List, Tuple, Callable, Union
-from urllib.parse import urlparse
 
 import telebot
 from telebot import types as tb_types
-
 
 FORMGRAM_PREFIX = '__ext__/fg'
 MISSING_VALUE_SYMBOL = '💢'
@@ -49,6 +46,12 @@ def make_cb_data(form_name, form_action: FormActions):
 
 def make_custom_button_cb_data(form_name, button_text):
     return f'{make_form_prefix(form_name)}/{FormActions.CUSTOM_BUTTON.value}/{button_text}'
+
+
+def escape_md(string: str) -> str:
+    for char in '_*~[`':
+        string = string.replace(char, f'\\{char}')
+    return string
 
 
 CANCEL_CB_DATA = f'{FORMGRAM_PREFIX}/cancel'
@@ -105,19 +108,22 @@ class Field:
             return missing_value_str
         return str(self.value)
 
-    def from_repr(self, string, missing_value_str: str):
-        if string == missing_value_str:
-            return None, None
-        return self.type_(string), None
+    def from_repr(self, text_value, html_value, missing_value_str: str):
+        """
+        Transform text representation of the field (both text and html representations provided).
+        If all field parameters are static the method should return just a value. If there are dynamic
+        parameters, a copy of the whole field must be returned.
+        :param text_value: Text representation of the field value
+        :param html_value: HTML representation of the field value
+        :param missing_value_str: Value that represents None
+        :return: value of type Field.type_ or copy of the field with value and all parameters set up
+        """
+        if text_value == missing_value_str:
+            return None
+        return self.type_(text_value)
 
     def from_str_value(self, string):
         return self.type_(string)
-
-    def from_metadata(self, metadata: dict) -> 'Field':
-        """Create a copy of field and recover metadata from provided dict
-        """
-        field_copy = copy.deepcopy(self)
-        return field_copy
 
     def make_button(self, callback_data: str):
         if self.needs_value():
@@ -150,37 +156,24 @@ class StrField(Field):
     def to_repr(self, missing_value_str: str):
         if self.value is None:
             return missing_value_str
-        return self.value
+        return escape_md(self.value)
 
-    def from_repr(self, string, missing_value_str: str):
-        if string == missing_value_str:
-            return None, None
-        return string, None
-
-
-class LinkField(StrField):
-    html_link_re = r'<a.*?>(.*?)</a>'
-
-    def from_repr(self, string, missing_value_str: str):
-        found = re.findall(self.html_link_re, string)
-        if len(found) == 0:
-            return None, None
-        found = found[0]
-        if found == missing_value_str:
-            return None, None
-        return found, None
-
-    def validate_input(self, new_value):
-        url = urlparse(new_value)
-        if '' not in (url.scheme, url.netloc):
-            return
-        raise ValueError(f'Link is not found in {new_value}')
+    def from_repr(self, text_value, _, missing_value_str: str):
+        if text_value == missing_value_str:
+            return None
+        return text_value
 
 
 class IntField(Field):
     def __init__(self, initial_value: Optional[int] = None, required: bool = False,
                  label: Optional[str] = None, read_only: bool = False, noneable: bool = True):
         super().__init__(int, initial_value, required, label, read_only, noneable)
+
+    def from_str_value(self, string):
+        try:
+            return int(string)
+        except ValueError as ve:
+            raise ValueError(f'Cannot cast "{string}" to integer!') from ve
 
 
 class BoolField(Field):
@@ -200,10 +193,10 @@ class BoolField(Field):
             return missing_value_str
         return self.val2repr[self.value]
 
-    def from_repr(self, string, missing_value_str: str):
-        if string == missing_value_str:
-            return None, None
-        return self.repr2val[string], None
+    def from_repr(self, text_value, _, missing_value_str: str):
+        if text_value == missing_value_str:
+            return None
+        return self.repr2val[text_value]
 
     def _handle_edit(self, bot: telebot.TeleBot, form: 'BaseForm', cb: tb_types.CallbackQuery):
         self.value = not self.value
@@ -268,19 +261,19 @@ class DynamicChoiceField(ChoiceField):
 
         return f'{value}[\u2009]({self.link_prefix}{joined_choices})'
 
-    def from_repr(self, string: str, missing_value_str: str):
-        a_idx = string.rfind('<a href=')
-        value = string[:a_idx]
+    def from_repr(self, _, html_value, missing_value_str: str):
+        field_copy = copy.deepcopy(self)
+
+        a_idx = html_value.rfind('<a href=')
+        value = html_value[:a_idx]
         if value == missing_value_str:
             value = None
-        href = string.split('"')[1]
+        href = html_value.split('"')[1]
         choices = href[len(self.link_prefix):].split(self.separator)
-        return value, {'value': value, 'choices': choices}
 
-    def from_metadata(self, metadata: dict) -> 'DynamicChoiceField':
-        field_copy = copy.deepcopy(self)
-        field_copy.value = metadata['value']
-        field_copy.choices = metadata['choices']
+        field_copy.value = value
+        field_copy.choices = choices
+
         return field_copy
 
 
@@ -347,7 +340,7 @@ class FormMeta(type):
 
             @bot.callback_query_handler(lambda cb: cb.data.startswith(make_form_prefix(name)))
             def handler(callback):
-                class_.handle_cb(class_.from_message(callback.message.html_text), callback)
+                class_.handle_cb(class_.from_message(callback.message), callback)
 
             @bot.callback_query_handler(lambda cb: cb.data == CANCEL_CB_DATA)
             def cancel(cb):
@@ -427,11 +420,12 @@ class BaseForm(metaclass=FormMeta):
     def refresh(self, chat_id, message_id, resend=False):
         if resend:
             self.bot.delete_message(chat_id, message_id)
-            self.bot.send_message(chat_id, self.to_message(), reply_markup=self.make_markup(), parse_mode='Markdown')
+            self.bot.send_message(chat_id, self.to_message(), reply_markup=self.make_markup(), parse_mode='Markdown',
+                                  disable_web_page_preview=True)
             return
 
         self.bot.edit_message_text(self.to_message(), chat_id, message_id, reply_markup=self.make_markup(),
-                                   parse_mode='Markdown')
+                                   parse_mode='Markdown', disable_web_page_preview=True)
 
     def handle_cb(self, callback: tb_types.CallbackQuery):
         parts = callback.data.split('/')
@@ -509,35 +503,39 @@ class BaseForm(metaclass=FormMeta):
         lines = []
         for field_name, field_options in self.fields_dict.items():
             value = field_options.to_repr(missing_value_str=self.missing_value_str)
-            lines.append(f'{field_options.label}{self.separator}{value}')
+            label = escape_md(field_options.label)
+            lines.append(f'{label}{self.separator}{value}')
         return '\n'.join(lines)
 
     @classmethod
-    def from_message(cls, message: str, **additional_kwargs):
+    def from_message(cls, message: tb_types.Message, **additional_kwargs):
         kwargs = {}
-        lines = message.splitlines()
-        for i, line in enumerate(lines):
-            sep_idx = line.find(cls.separator)
-            # Last line is trimmed in Telegram, so when the value is missing
-            # the trailing separator with whitespaces is trimmed
-            if sep_idx == -1 and i == len(lines) - 1:
-                trimmed_separator = cls.separator.strip()
-                if line[-1] != trimmed_separator:
-                    raise ValueError(f'Cannot deserialize message {message}')
-                label, value = line[:-1 * len(trimmed_separator)], cls.missing_value_str
-            else:
-                label, value = line[:sep_idx], line[sep_idx + len(cls.separator):]
-            field_name = cls._label_to_field[label]
+        text_lines = message.text.splitlines()
+        for i, (text_line, html_line) in enumerate(zip(text_lines, message.html_text.splitlines())):
+
+            labels = []
+            values = []
+
+            for line in (text_line, html_line):
+                sep_idx = line.find(cls.separator)
+                # Last line is trimmed in Telegram, so when the value is missing
+                # the trailing separator with whitespaces is trimmed
+                if sep_idx == -1 and i == len(text_lines) - 1:
+                    trimmed_separator = cls.separator.strip()
+                    if line[-1] != trimmed_separator:
+                        raise ValueError(f'Cannot deserialize message {message}')
+                    label, value = line[:-1 * len(trimmed_separator)], cls.missing_value_str
+                else:
+                    label, value = line[:sep_idx], line[sep_idx + len(cls.separator):]
+
+                labels.append(label)
+                values.append(value)
+
+            field_name = cls._label_to_field[labels[0]]
             field = cls.fields_dict[field_name]
 
-            value, metadata = field.from_repr(value, missing_value_str=cls.missing_value_str)
-
-            if not metadata:
-                kwargs[field_name] = value
-                continue
-
-            field = field.from_metadata(metadata)
-            kwargs[field_name] = field
+            value_or_field = field.from_repr(values[0], values[1], missing_value_str=cls.missing_value_str)
+            kwargs[field_name] = value_or_field
 
         return cls(**kwargs, **additional_kwargs)
 
@@ -575,4 +573,5 @@ class BaseForm(metaclass=FormMeta):
         return markup
 
     def send_form(self, chat_id):
-        self.bot.send_message(chat_id, self.to_message(), reply_markup=self.make_markup(), parse_mode='Markdown')
+        self.bot.send_message(chat_id, self.to_message(), reply_markup=self.make_markup(), parse_mode='Markdown',
+                              disable_web_page_preview=True)
