@@ -1,4 +1,4 @@
-# formgram
+# Formgram
 Small extension for pyTelegramBotAPI library for building interactive forms in Telegram bots without storing intermediate state.
 
 
@@ -23,8 +23,8 @@ Forms are class-based. To create a form inherit from a `BaseForm` class and conf
 
 |                     | Mandatory? | Default | Type                                                      | Description                                                                                                                                                           |
 |---------------------|------------|---------|-----------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `bot`               | Yes        |         | `telebot.TeleBot`                                         | Bot object to use for serving form                                                                                                                                    |
-| `submit_callback`   | Yes        |         | `Callable[[BaseForm, telebot.types.CallbackQuery], None]` | `f(form, callback_query)` that is invoked on form submission                                                                                                          |
+| `bot`               | **Yes**    |         | `telebot.TeleBot`                                         | Bot object to use for serving form                                                                                                                                    |
+| `submit_callback`   | **Yes**    |         | `Callable[[BaseForm, telebot.types.CallbackQuery], None]` | `f(form, callback_query)` that is invoked on form submission                                                                                                          |
 | `cancel_callback`   | No         | `None`  | `Callable[[BaseForm, telebot.types.CallbackQuery], None]` | `f(form, callback_query)` that is invoke on form cancelation. `Cancel` button appears if only cancel_callback provided (not `None`).                                               |
 | `custom_buttons`    | No         | `[]`    | `List[CustomButton]`                                      | Custom buttons display in the end of form's keyboard, right before `OK`/`Cancel` buttons.                                                                             |
 | `separator`         | No         | `': '`  | `str`                                                     | A string to put between field label and field value in the form state message                                                                                         |
