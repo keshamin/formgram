@@ -1,5 +1,6 @@
 import copy
 import enum
+import re
 from collections import Iterable
 from dataclasses import dataclass
 from typing import Optional, Any, Dict, List, Tuple, Callable, Union
@@ -7,9 +8,10 @@ from typing import Optional, Any, Dict, List, Tuple, Callable, Union
 import telebot
 from telebot import types as tb_types
 
-FORMGRAM_PREFIX = '__ext__/fg'
-MISSING_VALUE_SYMBOL = '💢'
-EDIT_SYMBOL = '✏️'
+FORMGRAM_PREFIX = '__fg'
+MISSING_VALUE_ICON = '💢'
+READ_ONLY_ICON = '🔒'
+EDIT_ICON = '✏️'
 
 
 @dataclass
@@ -24,8 +26,8 @@ class FormActions(enum.Enum):
     SUBMIT = 'ok'
     CANCEL = 'ca'
     DISPLAY_MAIN = 'dm'
-    INLINE_EDIT = 'ie'
     CUSTOM_BUTTON = 'cb'
+    FIELD_HANDLER = 'fh'
 
 
 def make_form_prefix(form_name: str) -> str:
@@ -36,16 +38,16 @@ def make_edit_cb_data(form_name: str, field_name: str) -> str:
     return f'{make_form_prefix(form_name)}/{FormActions.EDIT.value}/{field_name}'
 
 
-def make_inline_edit_cb_data(form_name: str, field_name: str, value: str) -> str:
-    return f'{make_form_prefix(form_name)}/{FormActions.INLINE_EDIT.value}/{field_name}/{value}'
-
-
 def make_cb_data(form_name, form_action: FormActions):
     return f'{make_form_prefix(form_name)}/{form_action.value}'
 
 
-def make_custom_button_cb_data(form_name, button_text):
-    return f'{make_form_prefix(form_name)}/{FormActions.CUSTOM_BUTTON.value}/{button_text}'
+def make_custom_button_cb_data(form_name, button_idx):
+    return f'{make_form_prefix(form_name)}/{FormActions.CUSTOM_BUTTON.value}/{button_idx}'
+
+
+def make_field_handler_cb_data(form_name: str, field_name: str, data: str):
+    return f'{make_form_prefix(form_name)}/{FormActions.FIELD_HANDLER.value}/{field_name}/{data}'
 
 
 def escape_md(string: str) -> str:
@@ -108,30 +110,37 @@ class Field:
             return missing_value_str
         return str(self.value)
 
-    def from_repr(self, text_value, html_value, missing_value_str: str):
+    def from_repr(self, text_value: Optional[str], meta: dict) -> 'Field':
         """
-        Transform text representation of the field (both text and html representations provided).
-        If all field parameters are static the method should return just a value. If there are dynamic
-        parameters, a copy of the whole field must be returned.
+        Builds a field from text representation + metadata dict.
         :param text_value: Text representation of the field value
-        :param html_value: HTML representation of the field value
-        :param missing_value_str: Value that represents None
-        :return: value of type Field.type_ or copy of the field with value and all parameters set up
+        :param meta: dict of field's metadata
+        :return: vaopy of the field with value and all parameters set up
         """
-        if text_value == missing_value_str:
-            return None
-        return self.type_(text_value)
+        field_copy = copy.deepcopy(self)
+
+        if text_value is None:
+            field_copy.value = None
+        else:
+            field_copy.value = self.type_(text_value)
+        return field_copy
 
     def from_str_value(self, string):
         return self.type_(string)
 
     def make_button(self, callback_data: str):
-        if self.needs_value():
-            icon = MISSING_VALUE_SYMBOL
-        else:
-            icon = EDIT_SYMBOL
-
+        icon = self.get_field_icon()
         return tb_types.InlineKeyboardButton(text=f'{icon} {self.label}', callback_data=callback_data)
+
+    def get_field_icon(self):
+        if self.read_only:
+            return READ_ONLY_ICON
+        if self.needs_value():
+            return MISSING_VALUE_ICON
+        return EDIT_ICON
+
+    def get_meta(self) -> dict:
+        return {}
 
     def _handle_edit(self, bot: telebot.TeleBot, form: 'BaseForm', cb: tb_types.CallbackQuery):
         sent_msg = bot.send_message(cb.message.chat.id, 'Send new value', reply_markup=edit_cancel_markup)
@@ -147,6 +156,9 @@ class Field:
             form.refresh(cb.message.chat.id, cb.message.message_id, resend=True)
         bot.register_next_step_handler(cb.message, handler)
 
+    def custom_handler(self, form: 'BaseForm', callback: tb_types.CallbackQuery):
+        pass
+
 
 class StrField(Field):
     def __init__(self, initial_value: Optional[str] = None, required: bool = False,
@@ -158,11 +170,10 @@ class StrField(Field):
             return missing_value_str
         return escape_md(self.value)
 
-    def from_repr(self, text_value, _, missing_value_str: str):
-        if text_value == missing_value_str:
-            return None
-        return text_value
-
+    def from_repr(self, text_value: Optional[str], meta: dict) -> 'Field':
+        field_copy = copy.deepcopy(self)
+        field_copy.value = text_value
+        return field_copy
 
 class IntField(Field):
     def __init__(self, initial_value: Optional[int] = None, required: bool = False,
@@ -193,10 +204,14 @@ class BoolField(Field):
             return missing_value_str
         return self.val2repr[self.value]
 
-    def from_repr(self, text_value, _, missing_value_str: str):
-        if text_value == missing_value_str:
-            return None
-        return self.repr2val[text_value]
+    def from_repr(self, text_value: Optional[str], meta: dict) -> 'Field':
+        field_copy = copy.deepcopy(self)
+
+        if text_value is None:
+            field_copy.value = None
+        else:
+            field_copy.value = self.repr2val[text_value]
+        return field_copy
 
     def _handle_edit(self, bot: telebot.TeleBot, form: 'BaseForm', cb: tb_types.CallbackQuery):
         self.value = not self.value
@@ -229,13 +244,13 @@ class ChoiceField(Field):
     def _handle_edit(self, bot: telebot.TeleBot, form: 'BaseForm', cb: tb_types.CallbackQuery):
         markup = tb_types.InlineKeyboardMarkup(row_width=self.row_width)
         choice_buttons = []
-        for choice in self.choices:
+        for i, choice in enumerate(self.choices):
             text = choice
             if self.value == choice:
                 text = '✅ ' + text
             choice_buttons.append(tb_types.InlineKeyboardButton(
                 text=text,
-                callback_data=form.make_inline_edit_cb_data(self.name, choice)
+                callback_data=form.make_field_handler_cb_data(self.name, str(i))
             ))
         markup.add(*choice_buttons)
 
@@ -245,36 +260,30 @@ class ChoiceField(Field):
         ))
         bot.edit_message_reply_markup(cb.message.chat.id, cb.message.message_id, reply_markup=markup)
 
+    def custom_handler(self, form: 'BaseForm', callback: tb_types.CallbackQuery):
+        choice_idx = int(callback.data.split('/')[4])
+        self.value = self.choices[choice_idx]
+        form.refresh(callback.message.chat.id, callback.message.message_id)
+
 
 class DynamicChoiceField(ChoiceField):
     link_prefix = 'http://example.com/?data='
-    separator = '&&&'
+    separator = '\u080D'    # should be unique char the user would never use
 
     def __init__(self, row_width: int = 1, required: bool = False, label: Optional[str] = None,
                  read_only: bool = False):
         super().__init__([], row_width=row_width, initial_value=None, required=required,
                          label=label, read_only=read_only, noneable=True)
 
-    def to_repr(self, missing_value_str: str):
-        value = self.value if self.value is not None else ''
-        joined_choices = self.separator.join(self.choices)
-
-        return f'{value}[\u2009]({self.link_prefix}{joined_choices})'
-
-    def from_repr(self, _, html_value, missing_value_str: str):
+    def from_repr(self, text_value: Optional[str], meta: dict) -> 'Field':
         field_copy = copy.deepcopy(self)
-
-        a_idx = html_value.rfind('<a href=')
-        value = html_value[:a_idx]
-        if value == missing_value_str:
-            value = None
-        href = html_value.split('"')[1]
-        choices = href[len(self.link_prefix):].split(self.separator)
-
-        field_copy.value = value
-        field_copy.choices = choices
-
+        field_copy.value = text_value
+        field_copy.choices = meta['choices'].split(self.separator)
         return field_copy
+
+    def get_meta(self) -> dict:
+        joined_choices = self.separator.join(self.choices)
+        return {'choices': joined_choices}
 
 
 def generate_init(fields_dict: Dict[str, Field]):
@@ -350,27 +359,23 @@ class FormMeta(type):
         # Custom buttons normalization
         if class_.custom_buttons is not None:
             buttons = []
-            buttons_dict = {}
 
             for obj in class_.custom_buttons:
                 if isinstance(obj, CustomButton):
                     buttons.append([obj])
-                    buttons_dict[obj.text] = obj
                     continue
 
                 if not isinstance(obj, Iterable):
                     raise ValueError('Items of custon_buttons list must be either '
                                      'CustomButton\'s or Iterable[CustomButton]')
 
-                buttons.append(obj)
                 for button in obj:
                     if not isinstance(button, CustomButton):
                         raise ValueError('Items of custon_buttons list must be either '
                                          'CustomButton\'s or Iterable[CustomButton]')
-                    buttons_dict[button.text] = button
+                buttons.append(obj)
 
             class_.custom_buttons = buttons
-            class_.custom_buttons_dict = buttons_dict
 
         return class_
 
@@ -394,7 +399,13 @@ class BaseForm(metaclass=FormMeta):
     bot: telebot.TeleBot = None
     submit_callback = None
     cancel_callback = None
-    custom_buttons: List[tb_types.InlineKeyboardButton] = []
+    custom_buttons: Union[List[tb_types.InlineKeyboardButton],
+                          List[List[tb_types.InlineKeyboardButton]]] = []
+
+    _meta_char = '\u2009'
+    _meta_link_prefix = 'http://ke.mi/?meta='
+    _meta_kv_separator = '\u0802'
+    _meta_concatenator = '\u0801'
 
     def __post_init__(self, *_, **__):
         pass
@@ -405,17 +416,17 @@ class BaseForm(metaclass=FormMeta):
     def make_cb_data(self, form_action: FormActions):
         return make_cb_data(self.__class__.__name__, form_action)
 
-    def make_inline_edit_cb_data(self, field_name: str, value: str) -> str:
-        return make_inline_edit_cb_data(self.__class__.__name__, field_name, value)
-
     def make_ok_cb_data(self):
         return self.make_cb_data(FormActions.SUBMIT)
 
     def make_cancel_cb_data(self):
         return self.make_cb_data(FormActions.CANCEL)
 
-    def make_custom_button_cb_data(self, button_text: str):
-        return make_custom_button_cb_data(self.__class__.__name__, button_text)
+    def make_field_handler_cb_data(self, field_name: str, data: str):
+        return make_field_handler_cb_data(self.__class__.__name__, field_name, data)
+
+    def make_custom_button_cb_data(self, button_idx: int):
+        return make_custom_button_cb_data(self.__class__.__name__, str(button_idx))
 
     def refresh(self, chat_id, message_id, resend=False):
         if resend:
@@ -429,14 +440,14 @@ class BaseForm(metaclass=FormMeta):
 
     def handle_cb(self, callback: tb_types.CallbackQuery):
         parts = callback.data.split('/')
-        action = parts[3]
+        action = parts[2]
         action_to_handler = {
             FormActions.EDIT.value: self.handle_edit,
             FormActions.SUBMIT.value: self.handle_submit,
             FormActions.CANCEL.value: self.handle_cancel,
             FormActions.DISPLAY_MAIN.value: self.handle_display_main,
-            FormActions.INLINE_EDIT.value: self.hanlde_inline_edit,
             FormActions.CUSTOM_BUTTON.value: self.handle_custom_button,
+            FormActions.FIELD_HANDLER.value: self.pass_to_field_handler,
         }
         if action not in action_to_handler:
             self.bot.answer_callback_query(callback.id, 'Unknown callback data!')
@@ -473,38 +484,53 @@ class BaseForm(metaclass=FormMeta):
     def handle_display_main(self, cb: tb_types.CallbackQuery):
         self.refresh(cb.message.chat.id, cb.message.message_id)
 
-    def hanlde_inline_edit(self, cb: tb_types.CallbackQuery):
+    def pass_to_field_handler(self, cb: tb_types.CallbackQuery):
         parts = cb.data.split('/')
-        field_name = parts[4]
-        new_value = '/'.join(parts[5:])
+        field_name = parts[3]
         field = self.fields_dict[field_name]
-        try:
-            field.value = field.from_str_value(new_value)
-        except ValueError:
-            self.bot.answer_callback_query(cb.id, 'Invalid value provided!')
-            return
-        self.refresh(cb.message.chat.id, cb.message.message_id)
+        field.custom_handler(form=self, callback=cb)
 
     def handle_custom_button(self, cb: tb_types.CallbackQuery):
         parts = cb.data.split('/')
-        button_text = '/'.join(parts[4:])
-        button_options = self.custom_buttons_dict[button_text]
+        button_idx = int(parts[3])
+        button_options = [button for button_row in self.custom_buttons for button in button_row][button_idx]
 
         button_options.callback(self, cb)
 
         if button_options.closes_form:
             self.close_form(cb.message.chat.id, cb.message.message_id)
 
-    @property
-    def fields(self) -> List[Field]:
-        return list(self.fields_dict.values())
+    def pack_meta_as_link(self, meta: dict) -> str:
+        meta_str = self._meta_concatenator.join([f'{k}{self._meta_kv_separator}{v}' for k, v in meta.items()])
+        return f'{self._meta_link_prefix}{meta_str}'
+
+    @classmethod
+    def parse_meta_from_link(cls, link: str) -> Optional[dict]:
+        meta_str = link[len(cls._meta_link_prefix):]
+        if not meta_str:
+            return None
+        return dict(((pair.split(cls._meta_kv_separator)) for pair in meta_str.split(cls._meta_concatenator)))
+
+    @classmethod
+    def extract_href_from_line(cls, line: str) -> Optional[str]:
+        href_re = r'href="(.*?)"'
+        found = re.findall(href_re, line)
+        if not found:
+            return None
+        return found[0]
 
     def to_message(self) -> str:
         lines = []
-        for field_name, field_options in self.fields_dict.items():
-            value = field_options.to_repr(missing_value_str=self.missing_value_str)
-            label = escape_md(field_options.label)
-            lines.append(f'{label}{self.separator}{value}')
+        for field_name, field in self.fields_dict.items():
+            icon = field.get_field_icon()
+            meta = field.get_meta()
+            if len(meta) > 0:
+                meta_container = f'[{self._meta_char}]({self.pack_meta_as_link(field.get_meta())})'
+            else:
+                meta_container = self._meta_char
+            value = field.to_repr(missing_value_str=self.missing_value_str)
+            label = escape_md(field.label)
+            lines.append(f'{icon}{meta_container}{label}{self.separator}{value}')
         return '\n'.join(lines)
 
     @classmethod
@@ -513,28 +539,32 @@ class BaseForm(metaclass=FormMeta):
         text_lines = message.text.splitlines()
         for i, (text_line, html_line) in enumerate(zip(text_lines, message.html_text.splitlines())):
 
-            labels = []
-            values = []
+            meta_char_idx = text_line.find(cls._meta_char)
+            text_line = text_line[meta_char_idx + 1:]  # Cut icon and meta
 
-            for line in (text_line, html_line):
-                sep_idx = line.find(cls.separator)
-                # Last line is trimmed in Telegram, so when the value is missing
-                # the trailing separator with whitespaces is trimmed
-                if sep_idx == -1 and i == len(text_lines) - 1:
-                    trimmed_separator = cls.separator.strip()
-                    if line[-1] != trimmed_separator:
-                        raise ValueError(f'Cannot deserialize message {message}')
-                    label, value = line[:-1 * len(trimmed_separator)], cls.missing_value_str
-                else:
-                    label, value = line[:sep_idx], line[sep_idx + len(cls.separator):]
+            sep_idx = text_line.find(cls.separator)
+            # Last line is trimmed in Telegram, so when the value is missing
+            # the trailing separator with whitespaces is trimmed
+            if sep_idx == -1 and i == len(text_lines) - 1:
+                trimmed_separator = cls.separator.strip()
+                if text_line[-1] != trimmed_separator:
+                    raise ValueError(f'Cannot deserialize message {message}')
+                label, value = text_line[:-1 * len(trimmed_separator)], cls.missing_value_str
+            else:
+                label, value = text_line[:sep_idx], text_line[sep_idx + len(cls.separator):]
 
-                labels.append(label)
-                values.append(value)
+            href = cls.extract_href_from_line(html_line)
+            meta = None
+            if href:
+                meta = cls.parse_meta_from_link(href)
 
-            field_name = cls._label_to_field[labels[0]]
+            field_name = cls._label_to_field[label]
             field = cls.fields_dict[field_name]
 
-            value_or_field = field.from_repr(values[0], values[1], missing_value_str=cls.missing_value_str)
+            if value == cls.missing_value_str:
+                value = None
+
+            value_or_field = field.from_repr(value, meta)
             kwargs[field_name] = value_or_field
 
         return cls(**kwargs, **additional_kwargs)
@@ -555,13 +585,15 @@ class BaseForm(metaclass=FormMeta):
         for field_name, field in filter(lambda x: not x[1].read_only, self.fields_dict.items()):
             markup.add(field.make_button(self.make_edit_cb_data(field_name)))
 
+        i = 0
         for button_row in self.custom_buttons:
             buttons = []
             for custom_button in button_row:
                 buttons.append(tb_types.InlineKeyboardButton(
                     text=custom_button.text,
-                    callback_data=self.make_custom_button_cb_data(custom_button.text)
+                    callback_data=self.make_custom_button_cb_data(button_idx=i)
                 ))
+                i += 1
             markup.row(*buttons)
 
         ok_cancel_buttons = [tb_types.InlineKeyboardButton('OK', callback_data=self.make_ok_cb_data())]
