@@ -17,7 +17,7 @@ Demo GIF for [docs/examples/example.py](docs/examples/example.py):
 
 ## Docs
 
-### Create a form
+### Create a Form
 
 Forms are class-based. To create a form inherit from a `BaseForm` class and configure it with class attributes.
 
@@ -47,7 +47,7 @@ class UserForm(fg.BaseForm):
     age = fg.IntField(label='Age')
 ```
 
-### Send a form
+### Send a Form
 
 After you defined a form use `form.send_form(chat_id)` method to send it to user.
 
@@ -62,3 +62,18 @@ def send_form(message: telebot.types.Message):
 **That is it!** Formgram takes care of the rest! All fields editing is handled automatically and submit/cancel callbacks are invoked when the form is completed/canceled. 
 
 <img src="docs/img/simple_form.jpeg" width="400" />
+
+
+### Fields
+
+There's a set of **common field options**. They are applicable to all field types, but some options can be irrelevant to certain field types. When so, the corresponding information can be found in the field type's section below.
+
+Common field options:
+
+| Option         | Type / Default            | Description                                                                                                                       |
+|----------------|---------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| `required`       | `bool` / `False`              | Required field has to be **not None** before form can be submitted.                                                          |
+| `initial_value` | `Optional[object]` / `None` | Initial value of the field, which still can be modified by user then.                                                            |
+| `label`          | `Optional[str]` / `None`    | User-visible field name. If omitted the class attribute name is used instead.                                                  |
+| `read_only`     | `bool` / `False`              | If field is `read_only` user doesn't have a button to modify the field value. Value can be modified only manually from the code. |
+| `noneable`       | `bool` / `True`               | If the field can take `None` as a value. Therefore: when not `noneable` the field must have an `initial_value`.                       |
