@@ -65,7 +65,7 @@ def send_form(message: telebot.types.Message):
     month_days_num = calendar.monthlen(now.year, now.month)
     month_days_list = [str(n + 1) for n in range(month_days_num)]
     # Set choices for this exact
-    form.fields_dict['day_of_month'].choices = month_days_list
+    form.fields.day_of_month.choices = month_days_list
 
     form.send_form(message.chat.id)
 

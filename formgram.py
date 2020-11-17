@@ -94,10 +94,10 @@ class Field:
         self._value = new_value
 
     def __get__(self, instance, type_=None):
-        return instance.fields_dict[self.name].value
+        return instance.fields[self.name].value
 
     def __set__(self, instance, value):
-        instance.fields_dict[self.name].value = value
+        instance.fields[self.name].value = value
 
     def validate_input(self, new_value):
         pass
@@ -174,6 +174,7 @@ class StrField(Field):
         field_copy = copy.deepcopy(self)
         field_copy.value = text_value
         return field_copy
+
 
 class IntField(Field):
     def __init__(self, initial_value: Optional[int] = None, required: bool = False,
@@ -293,7 +294,7 @@ def generate_init(fields_dict: Dict[str, Field]):
         kw = dict(zip(fields_dict, args))
         kw.update(kwargs)
 
-        self.fields_dict = {}
+        self._fields_dict = {}
 
         for field_name, field_obj in fields_dict.items():
             provided = kw.get(field_name)
@@ -304,7 +305,9 @@ def generate_init(fields_dict: Dict[str, Field]):
                 if field_name in kw:
                     field_obj.value = kw[field_name]
             self.__dict__[field_name] = field_obj
-            self.fields_dict[field_name] = field_obj
+            self._fields_dict[field_name] = field_obj
+
+        self.fields = FieldsContainer(self._fields_dict)
 
         if hasattr(self, '__post_init__'):
             self.__post_init__(**kwargs)
@@ -318,6 +321,25 @@ def generate_repr(class_name, fields_dict: Dict[str, Field]):
         return f'{class_name}({", ".join(params)})'
 
     return class_repr
+
+
+class FieldsContainer:
+    def __init__(self, fields_dict: Dict[str, Field]):
+        self._fields_dict = fields_dict
+
+    def __getattr__(self, item):
+        if item in self._fields_dict:
+            return self._fields_dict[item]
+        raise AttributeError(f'Form does not have field {item}')
+
+    def __getitem__(self, item):
+        return self._fields_dict[item]
+
+    def __iter__(self):
+        return iter(self._fields_dict.items())
+
+    def __contains__(self, item):
+        return item in self._fields_dict
 
 
 class FormMeta(type):
@@ -342,7 +364,8 @@ class FormMeta(type):
 
             class_._label_to_field[field_obj.label] = field_name
 
-        class_.fields_dict = fields_dict
+        class_._fields_dict = fields_dict
+        class_.fields = FieldsContainer(fields_dict)
 
         if name != 'BaseForm':
             bot = attrs.get('bot')
@@ -456,7 +479,7 @@ class BaseForm(metaclass=FormMeta):
 
     def handle_edit(self, callback: tb_types.CallbackQuery):
         field_name = callback.data.split('/')[-1]
-        field = self.fields_dict.get(field_name)
+        field = self._fields_dict.get(field_name)
         if not field:
             self.bot.answer_callback_query(callback.id, 'Trying to edit unknown field!')
         field._handle_edit(self.bot, self, callback)
@@ -487,7 +510,7 @@ class BaseForm(metaclass=FormMeta):
     def pass_to_field_handler(self, cb: tb_types.CallbackQuery):
         parts = cb.data.split('/')
         field_name = parts[3]
-        field = self.fields_dict[field_name]
+        field = self.fields[field_name]
         field.custom_handler(form=self, callback=cb)
 
     def handle_custom_button(self, cb: tb_types.CallbackQuery):
@@ -521,7 +544,7 @@ class BaseForm(metaclass=FormMeta):
 
     def to_message(self) -> str:
         lines = []
-        for field_name, field in self.fields_dict.items():
+        for field_name, field in self.fields:
             icon = field.get_field_icon()
             meta = field.get_meta()
             if len(meta) > 0:
@@ -559,7 +582,7 @@ class BaseForm(metaclass=FormMeta):
                 meta = cls.parse_meta_from_link(href)
 
             field_name = cls._label_to_field[label]
-            field = cls.fields_dict[field_name]
+            field = cls.fields[field_name]
 
             if value == cls.missing_value_str:
                 value = None
@@ -575,14 +598,14 @@ class BaseForm(metaclass=FormMeta):
     def validate(self):
         missing_fields = dict(filter(
             lambda entry: entry[1].required and entry[1].value is None,
-            self.fields_dict.items()
+            self.fields
         ))
         if missing_fields:
             raise ValidationError(missing_fields=missing_fields)
 
     def make_markup(self):
         markup = tb_types.InlineKeyboardMarkup()
-        for field_name, field in filter(lambda x: not x[1].read_only, self.fields_dict.items()):
+        for field_name, field in filter(lambda x: not x[1].read_only, self.fields):
             markup.add(field.make_button(self.make_edit_cb_data(field_name)))
 
         i = 0
@@ -607,3 +630,4 @@ class BaseForm(metaclass=FormMeta):
     def send_form(self, chat_id):
         self.bot.send_message(chat_id, self.to_message(), reply_markup=self.make_markup(), parse_mode='Markdown',
                               disable_web_page_preview=True)
+
