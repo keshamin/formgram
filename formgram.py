@@ -65,13 +65,15 @@ edit_cancel_markup.add(edit_cancel_button)
 class Field:
 
     def __init__(self, type_: type, initial_value: Any = None, required: bool = False,
-                 label: Optional[str] = None, read_only: bool = False, noneable: bool = True):
+                 label: Optional[str] = None, read_only: bool = False, noneable: bool = True,
+                 validator: Optional[Callable] = None):
         if initial_value is None and not noneable:
             raise ValueError('Initial value is not provided for field that isn\'t None-able.')
 
         self.name = None
         self.type_ = type_
         self.noneable = noneable
+        self.validator = validator
         self.value = initial_value
         self.required = required
         self.label = label
@@ -84,12 +86,19 @@ class Field:
     @value.setter
     def value(self, new_value):
         if new_value is None and not self.noneable:
-            raise ValueError('New value is None, but the field is not None-able')
+            raise FieldValidationError('New value is None, but the field is not None-able')
 
         if type(new_value) not in (self.type_, type(None)):
-            raise ValueError(f'Field value must be of type {self.type_}, not {type(new_value)}')
+            raise FieldValidationError(f'Field value must be of type {self.type_}, not {type(new_value)}')
 
-        self.validate_input(new_value)
+        # Validations for non-None values
+        if new_value:
+            # Field class specific validation
+            self.validate_input(new_value)
+
+            # Field instance specific validation
+            if self.validator:
+                self.validator(new_value)
 
         self._value = new_value
 
@@ -150,8 +159,8 @@ class Field:
                                           reply_markup=tb_types.InlineKeyboardMarkup())
             try:
                 self.value = self.from_str_value(msg.text)
-            except ValueError as e:
-                bot.send_message(cb.message.chat.id, str(e))
+            except FieldValidationError as e:
+                bot.send_message(cb.message.chat.id, e.validation_error)
                 return
             form.refresh(cb.message.chat.id, cb.message.message_id, resend=True)
         bot.register_next_step_handler(cb.message, handler)
@@ -162,8 +171,9 @@ class Field:
 
 class StrField(Field):
     def __init__(self, initial_value: Optional[str] = None, required: bool = False,
-                 label: Optional[str] = None, read_only: bool = False, noneable: bool = True):
-        super().__init__(str, initial_value, required, label, read_only, noneable)
+                 label: Optional[str] = None, read_only: bool = False, noneable: bool = True,
+                 validator: Optional[Callable] = None):
+        super().__init__(str, initial_value, required, label, read_only, noneable, validator)
 
     def to_repr(self, missing_value_str: str):
         if self.value is None:
@@ -178,8 +188,9 @@ class StrField(Field):
 
 class IntField(Field):
     def __init__(self, initial_value: Optional[int] = None, required: bool = False,
-                 label: Optional[str] = None, read_only: bool = False, noneable: bool = True):
-        super().__init__(int, initial_value, required, label, read_only, noneable)
+                 label: Optional[str] = None, read_only: bool = False, noneable: bool = True,
+                 validator: Optional[Callable] = None):
+        super().__init__(int, initial_value, required, label, read_only, noneable, validator)
 
     def from_str_value(self, string):
         try:
@@ -191,8 +202,8 @@ class IntField(Field):
 class BoolField(Field):
     def __init__(self, representation: Union[Dict[bool, str], Callable] = lambda: {True: '✅', False: '❌'},
                  initial_value: Optional[bool] = None, required: bool = False, label: Optional[str] = None,
-                 read_only: bool = False, noneable: bool = True):
-        super().__init__(bool, initial_value, required, label, read_only, noneable)
+                 read_only: bool = False, noneable: bool = True, validator: Optional[Callable] = None):
+        super().__init__(bool, initial_value, required, label, read_only, noneable, validator)
 
         if callable(representation):
             representation = representation()
@@ -229,7 +240,8 @@ class BoolField(Field):
 
 class ChoiceField(Field):
     def __init__(self, choices: Union[List[str], Callable], row_width: int = 1, initial_value: Optional[str] = None,
-                 required: bool = False, label: Optional[str] = None, read_only: bool = False, noneable: bool = True):
+                 required: bool = False, label: Optional[str] = None, read_only: bool = False, noneable: bool = True,
+                 validator: Optional[Callable] = None):
 
         if callable(choices):
             choices = choices()
@@ -240,7 +252,7 @@ class ChoiceField(Field):
         self.choices = choices
         self.row_width = row_width
 
-        super().__init__(str, initial_value, required, label, read_only, noneable)
+        super().__init__(str, initial_value, required, label, read_only, noneable, validator)
 
     def _handle_edit(self, bot: telebot.TeleBot, form: 'BaseForm', cb: tb_types.CallbackQuery):
         markup = tb_types.InlineKeyboardMarkup(row_width=self.row_width)
@@ -272,9 +284,9 @@ class DynamicChoiceField(ChoiceField):
     separator = '\u080D'    # should be unique char the user would never use
 
     def __init__(self, row_width: int = 1, required: bool = False, label: Optional[str] = None,
-                 read_only: bool = False):
+                 read_only: bool = False, validator: Optional[Callable] = None):
         super().__init__([], row_width=row_width, initial_value=None, required=required,
-                         label=label, read_only=read_only, noneable=True)
+                         label=label, read_only=read_only, noneable=True, validator=validator)
 
     def from_repr(self, text_value: Optional[str], meta: dict) -> 'Field':
         field_copy = copy.deepcopy(self)
@@ -403,7 +415,7 @@ class FormMeta(type):
         return class_
 
 
-class ValidationError(Exception):
+class FormValidationError(Exception):
     def __init__(self, *args, missing_fields: Optional[dict] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.missing_fields = missing_fields
@@ -413,6 +425,12 @@ class ValidationError(Exception):
         if self.missing_fields:
             m += f'Missing fields: {", ".join(self.missing_fields)}'
         return m
+
+
+class FieldValidationError(Exception):
+    def __init__(self, exception_message, user_message=None):
+        self.validation_error = user_message or exception_message or 'Validation error!'
+        super().__init__(exception_message)
 
 
 class BaseForm(metaclass=FormMeta):
@@ -487,7 +505,7 @@ class BaseForm(metaclass=FormMeta):
     def handle_submit(self, cb: tb_types.CallbackQuery):
         try:
             self.validate()
-        except ValidationError as ve:
+        except FormValidationError as ve:
             if ve.missing_fields:
                 msg = 'Fill all required fields first!'
             else:
@@ -601,7 +619,7 @@ class BaseForm(metaclass=FormMeta):
             self.fields
         ))
         if missing_fields:
-            raise ValidationError(missing_fields=missing_fields)
+            raise FormValidationError(missing_fields=missing_fields)
 
     def make_markup(self):
         markup = tb_types.InlineKeyboardMarkup()
